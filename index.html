@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+  <!-- iPhone: ホーム画面に追加でフルスクリーン動作 -->
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+  <meta name="apple-mobile-web-app-title" content="BJ Counter" />
+  <title>BJ Counter</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body, #root { height: 100%; background: #000; }
+    button { -webkit-appearance: none; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useCallback } = React;
+
+    const DELTA = { low: 1, mid: 0, high: -1 };
+    const betX  = tc => tc >= 5 ? 5 : tc >= 3 ? 3 : tc >= 1 ? 2 : 1;
+
+    function App() {
+      const [page,   setPage]   = useState("setup");
+      const [decks,  setDecks]  = useState(6);
+      const [dispRc, setDispRc] = useState(0);
+      const [dispDt, setDispDt] = useState(0);
+      const [flash,  setFlash]  = useState("");
+
+      const S  = useRef({ rc: 0, dealt: 0, total: 312, hist: [] });
+      const Au = useRef({ ctx: null });
+      const To = useRef({ s: null, lpt: null });
+      const Fl = useRef({ on: true, cd: false, pv: 0.5 });
+
+      useEffect(() => { S.current.total = decks * 52; }, [decks]);
+
+      const getTc = () =>
+        S.current.rc / Math.max(0.5, (S.current.total - S.current.dealt) / 52);
+
+      // ── Audio ──────────────────────────────────────────────────────────────
+      const initAudio = useCallback(() => {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        Au.current.ctx = ctx;
+        const o = ctx.createOscillator(), g = ctx.createGain();
+        g.gain.value = 0.001;
+        o.connect(g); g.connect(ctx.destination); o.start();
+      }, []);
+
+      const tone = useCallback((freq, dur, delay = 0) => {
+        const ctx = Au.current.ctx;
+        if (!ctx) return;
+        if (ctx.state === "suspended") ctx.resume();
+        const t = ctx.currentTime + delay;
+        const o = ctx.createOscillator(), g = ctx.createGain();
+        o.type = "sine"; o.frequency.value = freq;
+        g.gain.setValueAtTime(0.001, t);
+        g.gain.linearRampToValueAtTime(0.40, t + 0.015);
+        g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+        o.connect(g); g.connect(ctx.destination);
+        o.start(t); o.stop(t + dur + 0.02);
+      }, []);
+
+      const playFeedback = useCallback((type, tc) => {
+        tone({ low: 1100, mid: 660, high: 330 }[type], 0.13);
+        const b = betX(tc), d = 0.25;
+        if      (b >= 5) [0,.18,.36,.54,.72].forEach(x => tone(1400, 0.13, d+x));
+        else if (b === 3) [0,.22,.44]        .forEach(x => tone(1100, 0.15, d+x));
+        else if (b === 2) [0,.22]            .forEach(x => tone(900,  0.15, d+x));
+      }, [tone]);
+
+      const playUndo = useCallback(() => {
+        tone(700, 0.08); tone(500, 0.13, 0.14);
+      }, [tone]);
+
+      // ── Card Input ─────────────────────────────────────────────────────────
+      const inputCard = useCallback((type) => {
+        if (Fl.current.cd || !Fl.current.on) return;
+        Fl.current.cd = true;
+        setTimeout(() => { Fl.current.cd = false; }, 350);
+        S.current.rc    += DELTA[type];
+        S.current.dealt  = Math.min(S.current.dealt + 1, S.current.total);
+        S.current.hist.push({ type, delta: DELTA[type] });
+        if (S.current.hist.length > 30) S.current.hist.shift();
+        const tc = getTc();
+        setDispRc(S.current.rc);
+        setDispDt(S.current.dealt);
+        playFeedback(type, tc);
+        setFlash(type);
+        setTimeout(() => setFlash(""), 130);
+      }, [playFeedback]);
+
+      const undoCard = useCallback(() => {
+        const h = S.current.hist;
+        if (!h.length) return;
+        const last = h.pop();
+        S.current.rc    -= last.delta;
+        S.current.dealt  = Math.max(0, S.current.dealt - 1);
+        setDispRc(S.current.rc);
+        setDispDt(S.current.dealt);
+        playUndo();
+      }, [playUndo]);
+
+      // ── Volume Button Detection ─────────────────────────────────────────────
+      useEffect(() => {
+        if (page !== "counting") return;
+        const ctx = Au.current.ctx;
+        if (!ctx) return;
+        let el, o2, g2;
+        try {
+          const dest = ctx.createMediaStreamDestination();
+          o2 = ctx.createOscillator(); g2 = ctx.createGain();
+          g2.gain.value = 0.0001;
+          o2.connect(g2); g2.connect(dest); o2.start();
+          el = new Audio(); el.srcObject = dest.stream;
+          el.volume = 0.5; Fl.current.pv = 0.5;
+          el.play().catch(() => {});
+          const onVol = () => {
+            if (Fl.current.cd || !Fl.current.on) return;
+            const diff = el.volume - Fl.current.pv;
+            if (Math.abs(diff) < 0.005) { Fl.current.pv = el.volume; return; }
+            inputCard(diff > 0 ? "low" : "high");
+            Fl.current.pv = el.volume;
+          };
+          el.addEventListener("volumechange", onVol);
+          return () => {
+            el.removeEventListener("volumechange", onVol);
+            el.pause(); el.srcObject = null;
+            try { o2.stop(); } catch(_) {}
+          };
+        } catch(_) {}
+      }, [page, inputCard]);
+
+      // ── App Visibility ──────────────────────────────────────────────────────
+      useEffect(() => {
+        const freeze = () => { Fl.current.on = false; Fl.current.cd = true; };
+        const thaw   = () => setTimeout(() => {
+          Fl.current.on = true; Fl.current.cd = false;
+        }, 1500);
+        const onVis = () => document.hidden ? freeze() : thaw();
+        document.addEventListener("visibilitychange", onVis);
+        window.addEventListener("blur",  freeze);
+        window.addEventListener("focus", thaw);
+        return () => {
+          document.removeEventListener("visibilitychange", onVis);
+          window.removeEventListener("blur",  freeze);
+          window.removeEventListener("focus", thaw);
+        };
+      }, []);
+
+      // ── Touch ───────────────────────────────────────────────────────────────
+      const onTS = useCallback((e) => {
+        if (page !== "counting") return;
+        const t = e.touches[0], W = window.innerWidth, H = window.innerHeight;
+        const edge =
+          t.clientX < 25 || t.clientX > W - 25 ||
+          t.clientY < 55 || t.clientY > H - 35;
+        To.current.s = { x: t.clientX, y: t.clientY, t: Date.now(), id: t.identifier, edge };
+        if (!edge) {
+          clearTimeout(To.current.lpt);
+          To.current.lpt = setTimeout(() => { To.current.s = null; undoCard(); }, 800);
+        }
+      }, [page, undoCard]);
+
+      const onTE = useCallback((e) => {
+        clearTimeout(To.current.lpt);
+        const s = To.current.s; To.current.s = null;
+        if (!s || Fl.current.cd || !Fl.current.on || page !== "counting") return;
+        const t = e.changedTouches[0];
+        if (t.identifier !== s.id || s.edge) return;
+        const dx = t.clientX - s.x, dy = t.clientY - s.y;
+        const dist = Math.hypot(dx, dy), dt = Date.now() - s.t;
+        if (dt > 750) return;
+        if (dist < 18 && dt >= 40) {
+          inputCard("mid");
+        } else if (dist >= 28 && dt < 400 && Math.abs(dy) > Math.abs(dx) * 0.8) {
+          inputCard(dy < 0 ? "low" : "high");
+        }
+      }, [page, inputCard]);
+
+      const onTC = useCallback(() => {
+        clearTimeout(To.current.lpt); To.current.s = null;
+      }, []);
+
+      // ── Setup Page ──────────────────────────────────────────────────────────
+      if (page === "setup") {
+        const startCounting = () => {
+          initAudio();
+          S.current = { rc: 0, dealt: 0, total: decks * 52, hist: [] };
+          setDispRc(0); setDispDt(0);
+          setPage("counting");
+        };
+
+        const Row = ({ a, b, c }) => (
+          <div style={{ display:"flex", justifyContent:"space-between", padding:"6px 0", borderBottom:"1px solid #161616" }}>
+            <span style={{ color:"#888", minWidth:88, fontSize:12 }}>{a}</span>
+            {b && <span style={{ color:"#555", flex:1, fontSize:11 }}>{b}</span>}
+            <span style={{ color:"#c9921a", fontSize:11 }}>{c}</span>
+          </div>
+        );
+
+        return (
+          <div style={{ minHeight:"100vh", background:"#0a0a0a", color:"#e0e0e0", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", fontFamily:"-apple-system,'Helvetica Neue',sans-serif", padding:"28px 20px 52px", gap:26, boxSizing:"border-box" }}>
+
+            <div style={{ textAlign:"center" }}>
+              <div style={{ fontSize:52, lineHeight:1 }}>🃏</div>
+              <div style={{ fontSize:24, fontWeight:700, marginTop:8 }}>BJ Counter</div>
+              <div style={{ fontSize:10, color:"#555", marginTop:5, letterSpacing:"0.14em" }}>HI-LO CARD COUNTING</div>
+            </div>
+
+            <div style={{ width:"100%", maxWidth:340, textAlign:"center" }}>
+              <div style={{ fontSize:10, color:"#555", marginBottom:14, letterSpacing:"0.14em" }}>DECKS</div>
+              <div style={{ display:"flex", gap:10, justifyContent:"center" }}>
+                {[1,2,4,6,8].map(n => (
+                  <button key={n} onClick={() => setDecks(n)} style={{ width:58, height:58, borderRadius:14, background:decks===n?"#c9921a":"#161616", color:decks===n?"#000":"#555", border:`1px solid ${decks===n?"#c9921a":"#222"}`, fontSize:20, fontWeight:700, cursor:"pointer" }}>{n}</button>
+                ))}
+              </div>
+              <div style={{ fontSize:11, color:"#333", marginTop:10 }}>
+                {decks} deck{decks>1?"s":""} · {decks*52} cards
+              </div>
+            </div>
+
+            <div style={{ width:"100%", maxWidth:340, background:"#111", borderRadius:18, padding:"20px 18px", border:"1px solid #1c1c1c", fontSize:12 }}>
+              <div style={{ fontSize:9, color:"#3a3a3a", letterSpacing:"0.14em", marginBottom:10 }}>INPUT</div>
+              <Row a="Swipe ↑"    b="2–6 (Low)"    c="+1" />
+              <Row a="Swipe ↓"    b="10–A (High)"  c="−1" />
+              <Row a="Tap"        b="7–9 (Mid)"    c="0" />
+              <Row a="Long press" b="Undo last"    c="—" />
+              <Row a="Vol ↑/↓"   b="Low / High *" c="+1/−1" />
+
+              <div style={{ fontSize:9, color:"#3a3a3a", letterSpacing:"0.14em", marginTop:16, marginBottom:10 }}>AUDIO  🎧 イヤホン推奨</div>
+              <Row a="High beep"       c="Low card confirmed" />
+              <Row a="Low beep"        c="High card confirmed" />
+              <Row a="Mid beep"        c="Neutral confirmed" />
+              <Row a="2× (TC≥1)"      c="Raise bet" />
+              <Row a="3× (TC≥3)"      c="BIG BET" />
+              <Row a="5× (TC≥5)"      c="MAX BET" />
+
+              <div style={{ fontSize:9, color:"#2a2a2a", marginTop:14, textAlign:"center", lineHeight:1.7 }}>
+                * ボリューム入力はブラウザ制限により非対応の場合があります<br/>
+                スワイプを主な入力として使用してください
+              </div>
+            </div>
+
+            <button onClick={startCounting} style={{ padding:"18px 0", background:"#c9921a", color:"#000", border:"none", borderRadius:18, fontSize:17, fontWeight:700, cursor:"pointer", width:"100%", maxWidth:340 }}>
+              START COUNTING
+            </button>
+          </div>
+        );
+      }
+
+      // ── Counting Page ───────────────────────────────────────────────────────
+      const tc  = getTc();
+      const bet = betX(tc);
+      const flashBg = { low:"#001800", mid:"#080808", high:"#180000", "":"#000000" }[flash] || "#000000";
+
+      const resetCount = () => {
+        S.current.rc = 0; S.current.dealt = 0; S.current.hist = [];
+        setDispRc(0); setDispDt(0);
+        tone(440, 0.2);
+      };
+
+      return (
+        <div
+          style={{ position:"fixed", inset:0, background:flashBg, overflow:"hidden", touchAction:"none", userSelect:"none", WebkitUserSelect:"none", WebkitTapHighlightColor:"transparent", transition:"background 0.08s" }}
+          onTouchStart={onTS} onTouchEnd={onTE} onTouchCancel={onTC}
+          onContextMenu={e => e.preventDefault()}
+        >
+          <div style={{ position:"absolute", top:60, right:14, textAlign:"right", fontFamily:'"SF Mono","Courier New",monospace', pointerEvents:"none", lineHeight:2 }}>
+            <div style={{ fontSize:9, color:"#1c1c1c" }}>RC · TC · BET</div>
+            <div style={{ fontSize:28, color:"#2a2a2a", fontWeight:700 }}>{dispRc >= 0 ? "+" : ""}{dispRc}</div>
+            <div style={{ fontSize:15, color:"#222" }}>TC {tc >= 0 ? "+" : ""}{tc.toFixed(1)}</div>
+            <div style={{ fontSize:30, color:bet>=3?"#3a2800":"#1e1e1e", fontWeight:700 }}>×{bet}</div>
+            <div style={{ fontSize:9, color:"#161616", marginTop:6 }}>{dispDt}/{S.current.total}</div>
+          </div>
+
+          <div style={{ position:"absolute", bottom:50, left:0, right:0, display:"flex", justifyContent:"center", gap:20 }}>
+            {[["RST", resetCount], ["← DK", () => setPage("setup")]].map(([lbl, fn]) => (
+              <div key={lbl}
+                style={{ padding:"10px 22px", border:"1px solid #1a1a1a", borderRadius:14, color:"#1a1a1a", fontSize:10, fontFamily:"monospace", cursor:"pointer" }}
+                onTouchStart={e => e.stopPropagation()}
+                onTouchEnd={e => { e.stopPropagation(); clearTimeout(To.current.lpt); To.current.s = null; fn(); }}
+              >{lbl}</div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
